@@ -1,0 +1,34 @@
+# Personal camera output — radiometric captures and pseudocolor renders
+snapshots/
+
+# Black-body calibration captures (raw BB TIFFs used to build calib.json)
+calib/
+
+# Per-unit calibration (specific to one physical camera; commit a
+# calib.example.json instead if you want to document schema)
+calib.json
+
+# Wireshark/pcap protocol captures
+*.pcap
+*.pcapng
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Claude Code local settings
+.claude/
+
+# Runtime logs
+*.log

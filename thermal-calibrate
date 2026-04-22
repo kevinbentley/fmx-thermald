@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Fit a linear (or quadratic) calibration from black-body snapshots.
+
+Usage:
+    thermal-calibrate --roi x0,y0,x1,y1 [--order 1|2] [--out calib.json] \\
+        SNAPSHOT1.tiff T_C1 SNAPSHOT2.tiff T_C2 ...
+
+ROI is inclusive (x0,y0 = top-left in image coords, x1,y1 = bottom-right).
+Pass at least 2 (tiff, temp) pairs; 3+ recommended so residuals are meaningful.
+"""
+import argparse, json, os, sys
+from pathlib import Path
+import numpy as np
+from PIL import Image
+
+def parse_roi(s):
+    try:
+        a = [int(v) for v in s.split(',')]
+        if len(a) != 4: raise ValueError
+        x0, y0, x1, y1 = a
+        # normalize so (x0,y0) is top-left and (x1,y1) is bottom-right (inclusive)
+        x_lo, x_hi = sorted((x0, x1))
+        y_lo, y_hi = sorted((y0, y1))
+        return x_lo, y_lo, x_hi, y_hi
+    except Exception:
+        raise argparse.ArgumentTypeError('roi must be "x0,y0,x1,y1" ints')
+
+def read_roi(path, roi):
+    im = np.array(Image.open(path))
+    if im.ndim != 2 or im.dtype != np.uint16:
+        sys.exit(f'{path}: expected 16-bit grayscale TIFF (got dtype {im.dtype}, shape {im.shape})')
+    x0, y0, x1, y1 = roi
+    H, W = im.shape
+    if not (0 <= x0 <= x1 < W and 0 <= y0 <= y1 < H):
+        sys.exit(f'{path}: ROI {roi} out of bounds for {W}x{H}')
+    block = im[y0:y1+1, x0:x1+1]
+    return block, im.shape
+
+def fit_poly(raw, tC, order):
+    """Return coefficients highest-order-first (as numpy), plus residuals/RMSE/R^2."""
+    coef = np.polyfit(raw, tC, order)
+    pred = np.polyval(coef, raw)
+    resid = tC - pred
+    rmse = float(np.sqrt(np.mean(resid**2)))
+    ss_res = float(np.sum(resid**2))
+    ss_tot = float(np.sum((tC - tC.mean())**2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
+    return coef, resid, rmse, r2
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+         formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--roi', type=parse_roi, required=True,
+                    help='ROI as "x0,y0,x1,y1" (inclusive, any opposing corners)')
+    ap.add_argument('--order', type=int, default=1, choices=[1, 2],
+                    help='fit order: 1 (linear, default) or 2 (quadratic)')
+    ap.add_argument('--out', default='calib.json', help='output JSON path')
+    ap.add_argument('--stat', default='median', choices=['median', 'mean'],
+                    help='ROI aggregation statistic')
+    ap.add_argument('pairs', nargs='+',
+                    help='alternating SNAPSHOT.tiff TEMP_C values')
+    args = ap.parse_args()
+
+    if len(args.pairs) % 2:
+        sys.exit('need an even number of arguments (tiff, temp pairs)')
+    pairs = list(zip(args.pairs[::2], args.pairs[1::2]))
+    if len(pairs) < 2:
+        sys.exit('need at least 2 calibration points')
+    if args.order == 2 and len(pairs) < 3:
+        sys.exit('quadratic fit needs at least 3 points')
+
+    roi = args.roi
+    print(f'ROI: x {roi[0]}..{roi[2]}  y {roi[1]}..{roi[3]}  '
+          f'({roi[2]-roi[0]+1}x{roi[3]-roi[1]+1} = '
+          f'{(roi[2]-roi[0]+1)*(roi[3]-roi[1]+1)} pixels)')
+    print()
+    print(f'{"file":<40} {"T_true":>8} {"raw_med":>8} {"raw_mean":>9} {"raw_std":>8}  raw range')
+    raws = []
+    temps = []
+    rows = []
+    for tiff, t_str in pairs:
+        try:
+            t_true = float(t_str)
+        except ValueError:
+            sys.exit(f'{t_str!r}: not a valid temperature')
+        block, shape = read_roi(tiff, roi)
+        raw_med = float(np.median(block))
+        raw_mean = float(block.mean())
+        raw_std = float(block.std())
+        raw = raw_med if args.stat == 'median' else raw_mean
+        raws.append(raw)
+        temps.append(t_true)
+        rows.append((tiff, t_true, raw_med, raw_mean, raw_std,
+                     int(block.min()), int(block.max())))
+        print(f'{os.path.basename(tiff):<40} {t_true:>8.2f} {raw_med:>8.1f} '
+              f'{raw_mean:>9.2f} {raw_std:>8.2f}  {int(block.min())}..{int(block.max())}')
+
+    raws = np.array(raws, dtype=np.float64)
+    temps = np.array(temps, dtype=np.float64)
+
+    coef, resid, rmse, r2 = fit_poly(raws, temps, args.order)
+    print()
+    if args.order == 1:
+        a, b = coef  # T = a*raw + b
+        print(f'Linear fit:  T_C = {a:.6g} * raw16 + {b:.6g}')
+        print(f'             slope = {a:.6f} K/count,  offset = {b:.3f} °C')
+    else:
+        a, b, c = coef
+        print(f'Quadratic fit:  T_C = {a:.6g} * raw^2 + {b:.6g} * raw + {c:.6g}')
+
+    print(f'RMSE = {rmse:.3f} °C    R² = {r2:.6f}')
+    print()
+    print(f'{"T_true":>8} {"raw":>9} {"T_pred":>8} {"resid":>8}')
+    for r_, t_, tp in zip(raws, temps, np.polyval(coef, raws)):
+        print(f'{t_:>8.2f} {r_:>9.1f} {tp:>8.3f} {t_-tp:>+8.3f}')
+
+    # Compare to our daemon's wrong guess
+    naive = raws/16.0 - 273.15
+    print()
+    print('Compare to uncalibrated daemon formula (raw/16 - 273.15):')
+    for t_, raw_, n_ in zip(temps, raws, naive):
+        print(f'  true {t_:5.2f} °C  ->  uncal {n_:6.2f} °C  (off by {n_-t_:+.2f})')
+
+    calib = {
+        'model': 'polynomial',
+        'order': args.order,
+        'coef_highest_first': [float(c) for c in coef],
+        'formula': ('T_C = a*raw + b' if args.order == 1 else 'T_C = a*raw^2 + b*raw + c'),
+        'roi_inclusive_xyxy': list(roi),
+        'roi_aggregate_stat': args.stat,
+        'points': [
+            {'tiff': os.path.abspath(t), 't_true_C': tt,
+             'raw_median': rm, 'raw_mean': mn, 'raw_std': sd,
+             'raw_min': mi, 'raw_max': mx}
+            for (t, tt, rm, mn, sd, mi, mx) in rows
+        ],
+        'rmse_C': rmse,
+        'r_squared': r2,
+        'residuals_C': [float(r) for r in resid],
+        'n_points': len(pairs),
+    }
+    out = Path(args.out)
+    out.write_text(json.dumps(calib, indent=2))
+    print(f'\nwrote {out.resolve()}')
+    if rmse > 0.5:
+        print(f'NOTE: RMSE > 0.5 °C — if using --order 1, try --order 2 for a better fit.')
+
+if __name__ == '__main__':
+    main()

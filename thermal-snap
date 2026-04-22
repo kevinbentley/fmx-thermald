@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Trigger a radiometric snapshot on the running thermald.
+
+Usage:
+    thermal-snap                        # auto-named by timestamp
+    thermal-snap calib_blackbody_35C    # named
+    thermal-snap --host 192.168.1.85    # non-default daemon host
+"""
+import argparse, json, sys
+import urllib.request
+import urllib.parse
+
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument('name', nargs='?', default=None,
+                help='base filename (no extension); defaults to timestamp')
+ap.add_argument('--host', default='localhost', help='thermald host')
+ap.add_argument('--port', type=int, default=8080, help='thermald port')
+args = ap.parse_args()
+
+url = f'http://{args.host}:{args.port}/snapshot'
+if args.name:
+    url += '?' + urllib.parse.urlencode({'name': args.name})
+
+try:
+    req = urllib.request.Request(url, method='POST')
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = r.read().decode()
+except Exception as e:
+    sys.exit(f'error: {e}')
+
+try:
+    info = json.loads(body)
+except ValueError:
+    sys.exit(f'unexpected response: {body}')
+
+if 'error' in info:
+    sys.exit(f"error: {info['error']}")
+
+print(f"saved frame seq={info['seq']}")
+print(f"  tiff: {info['tiff']}")
+print(f"  png:  {info['png']}")
+print(f"  json: {info['json']}")

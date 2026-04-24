@@ -17,6 +17,7 @@ you're in the same family.
 |---|---|
 | `thermald.py` | The daemon. Holds the (single) RTSP session, parses HYAV frames into 16-bit radiometric arrays, serves the HTTP endpoints. |
 | `thermal-snap` | Small client that POSTs to `/snapshot`. Saves `<name>.tiff` (16-bit raw), `<name>.png` (pseudocolor), and `<name>.json` (sidecar w/ calibration). |
+| `thermal-focus` | CLI for the port-36399 lens-control protocol: `thermal-focus step [N]` for manual focus steps, `thermal-focus auto` for one-shot autofocus. Talks directly to the camera; doesn't need `thermald.py` running. |
 | `thermal-calibrate` | Fits a linear (or quadratic) `T_C = f(raw16)` model from black-body snapshots. Produces `calib.json`. |
 | `rtsp_probe.py` | Reference implementation of the handshake and HYAV parse. Good for diagnosing new cameras. |
 | `calib.example.json` | Schema reference for `calib.json`. The coefficients are from one unit — don't use them on yours. |
@@ -55,6 +56,33 @@ official spec was used. Verified live on an ICI FMX 400P (MAC OUI
 6. Only **one RTSP session at a time**. If thermald dies without sending
    TEARDOWN, the camera refuses new connections for up to ~60 s.
 
+### Focus / lens control (port 36399)
+
+The RTSP stream is read-only. Focus commands ride on a separate TCP port
+(`36399`), using a tiny framed request/response protocol reverse-engineered
+from a Wireshark capture of `IRFlash` and confirmed live.
+
+Frame format (both directions):
+
+```
+7D FF 00 00 | AA | LEN | <body> | CHK | EB AA
+  LEN = len(body) + 1   # covers body + CHK
+  CHK = (0xAA + LEN + sum(body)) & 0xFF
+```
+
+The camera ACKs every command with the fixed 4-byte frame `7D FF 00 7B`.
+Both observed commands belong to class `08` (lens/PTZ):
+
+| command | body | effect |
+|---|---|---|
+| manual focus step | `08 21 01 02 01` — `{class=08, sub=21, ch=01, dir=02, speed=01}` | one motor increment per call |
+| one-shot autofocus | `08 2F 01 00` — `{class=08, sub=2F, ch=01, mode=00}` | camera hunts on its own |
+
+`thermal-focus` (and `POST /focus?cmd=step|auto` on the daemon) are the
+thin wrappers around this. The step direction byte (`0x02`) is what the
+vendor app uses; flipping it to reach the other direction is not yet
+confirmed.
+
 ## Requirements
 
 - Python 3.10+
@@ -73,7 +101,9 @@ python3 thermald.py --host 192.168.1.123 --port 8080
 
 Open `http://<host>:8080/` in a browser — you'll see a live pseudocolor
 preview. Mousing over the image shows the temperature at the pixel under
-the cursor; hit **save snapshot** to dump the current frame to disk.
+the cursor; hit **save snapshot** to dump the current frame to disk. The
+**step** and **auto** focus buttons drive the camera's lens motor via the
+port-36399 protocol described below.
 
 ### Command-line options
 
@@ -92,10 +122,11 @@ the cursor; hit **save snapshot** to dump the current frame to disk.
 
 | method+path | description |
 |---|---|
-| `GET /` | Dashboard page with preview, mouseover, snapshot button, calibration badge |
+| `GET /` | Dashboard page with preview, mouseover, snapshot + focus buttons, calibration badge |
 | `GET /preview.mjpg` | Live MJPEG stream (ironbow pseudocolor) |
 | `GET /snapshot.tiff` | Most recent frame as 16-bit TIFF (no sidecar) |
 | `POST /snapshot?name=…` | Save `<name>.tiff`, `<name>.png`, `<name>.json` to snapshot dir. Auto-names by timestamp if `name` omitted. |
+| `POST /focus?cmd=step\|auto` | Send a lens-control command on port 36399. `step` = one manual focus step; `auto` = one-shot autofocus. Returns the framed bytes sent and the camera's ACK. |
 | `GET /pixel?x=&y=` | JSON: `raw16`, `T_C`, `T_F`, `T_K`, `calibrated` |
 | `GET /status` | JSON: readiness, frame stats, loaded calibration info |
 

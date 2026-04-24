@@ -10,6 +10,7 @@ Endpoints:
   GET  /preview.mjpg       live MJPEG (multipart/x-mixed-replace)
   GET  /snapshot.tiff      most recent raw 16-bit frame as TIFF
   POST /snapshot           write TIFF + PNG + JSON sidecar to disk
+  POST /focus?cmd=step|auto  manual focus step or one-shot autofocus (port 36399)
   GET  /pixel?x=&y=        temperature at pixel (°C/°F/K)
   GET  /status             daemon + last-frame stats + calibration info as JSON
 
@@ -35,6 +36,36 @@ FRAME_DATA = 2 * PLANE         # 221 184 bytes of pixels per frame
 DEFAULT_HOST = '192.168.1.123'
 DEFAULT_PATH = '/cam/realmonitor?channel=1&subtype=0'
 DEFAULT_CALIB_PATH = '/home/kbentley/thermal/calib.json'
+
+# ---- Focus/lens control (port 36399) --------------------------------------
+# Framing:  7D FF 00 00 | AA | LEN | <body> | CHK | EB AA
+#   LEN = len(body) + 1  (covers body + CHK)
+#   CHK = (0xAA + LEN + sum(body)) & 0xFF
+# Camera ACKs with the fixed 4-byte frame 7D FF 00 7B.
+FOCUS_PORT = 36399
+FOCUS_COMMANDS = {
+    'step': bytes.fromhex('0821010201'),   # manual focus step, one motor increment
+    'auto': bytes.fromhex('082f0100'),     # one-shot autofocus
+}
+
+def _focus_frame(body):
+    ln = len(body) + 1
+    chk = (0xAA + ln + sum(body)) & 0xFF
+    return b'\x7d\xff\x00\x00\xaa' + bytes([ln]) + body + bytes([chk]) + b'\xeb\xaa'
+
+def send_focus(host, body, timeout=2.0):
+    """Open a short-lived TCP connection to port 36399, send one framed
+    command, and return the camera's reply bytes."""
+    frame = _focus_frame(body)
+    with socket.create_connection((host, FOCUS_PORT), timeout=timeout) as s:
+        s.sendall(frame)
+        resp = b''
+        while len(resp) < 4:
+            chunk = s.recv(4 - len(resp))
+            if not chunk:
+                break
+            resp += chunk
+    return resp
 
 # ---- Calibration ----------------------------------------------------------
 # Loaded at startup. When present, raw_to_C evaluates the polynomial from
@@ -365,6 +396,7 @@ def camera_supervisor(host):
 
 # ---- HTTP server ----------------------------------------------------------
 SNAPSHOT_DIR = os.environ.get('THERMAL_SNAPSHOTS', '/home/kbentley/thermal/snapshots')
+CAMERA_HOST = {'ref': DEFAULT_HOST}  # filled in by main() from --host
 
 INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>thermald</title>
 <style>
@@ -393,7 +425,15 @@ INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>thermald
  <div id="xh"></div>
 </div>
 <div id="readout">move cursor over image &rarr; temperature</div>
-<p><button onclick="snap()">save snapshot</button><span id="snapmsg"></span></p>
+<p>
+ <button onclick="snap()">save snapshot</button>
+ <span style="margin-left:12px;padding-left:12px;border-left:1px solid #444"></span>
+ focus:
+ <button onclick="focusCmd('step')" title="one manual focus step">step</button>
+ <button onclick="focusCmd('auto')" title="one-shot autofocus">auto</button>
+ <span id="focusmsg" style="font-family:monospace;font-size:13px;margin-left:8px;color:#aaa"></span>
+ <br><span id="snapmsg"></span>
+</p>
 <p>Endpoints:
 <a href="/snapshot.tiff">/snapshot.tiff</a> &middot;
 <a href="/status">/status</a> &middot;
@@ -466,6 +506,19 @@ async function snap(){
       j.error ? (' error: '+j.error) : (' saved seq='+j.seq+' -> '+j.tiff);
   }catch(e){
     document.getElementById('snapmsg').textContent=' error: '+e;
+  }
+}
+
+async function focusCmd(cmd){
+  const msg=document.getElementById('focusmsg');
+  msg.style.color='#aaa'; msg.textContent=cmd+' …';
+  try{
+    const r=await fetch('/focus?cmd='+cmd,{method:'POST'});
+    const j=await r.json();
+    if(j.error){ msg.style.color='#f88'; msg.textContent=cmd+': '+j.error; }
+    else{ msg.style.color=j.ack?'#8f8':'#fc0'; msg.textContent=cmd+(j.ack?' ✓':' reply='+j.reply); }
+  }catch(e){
+    msg.style.color='#f88'; msg.textContent=cmd+': '+e;
   }
 }
 </script></body></html>""".encode('utf-8')
@@ -546,7 +599,25 @@ class Handler(BaseHTTPRequestHandler):
             if out is None:
                 return self._json({'error': 'no frame yet'}, status=503)
             return self._json(out)
+        if u.path == '/focus':
+            return self._focus(parse_qs(u.query))
         self.send_error(404)
+
+    def _focus(self, qs):
+        cmd = (qs.get('cmd', [''])[0] or '').lower()
+        if cmd not in FOCUS_COMMANDS:
+            return self._json({'error': f'cmd must be one of {sorted(FOCUS_COMMANDS)}'}, 400)
+        try:
+            resp = send_focus(CAMERA_HOST['ref'], FOCUS_COMMANDS[cmd])
+        except OSError as e:
+            return self._json({'error': f'{type(e).__name__}: {e}'}, 502)
+        ack = b'\x7d\xff\x00\x7b'
+        return self._json({
+            'cmd': cmd,
+            'sent': _focus_frame(FOCUS_COMMANDS[cmd]).hex(),
+            'reply': resp.hex(),
+            'ack': resp == ack,
+        })
 
     def _mjpeg(self):
         bnd = b'thermalframe'
@@ -639,6 +710,7 @@ def main():
     args = ap.parse_args()
 
     load_calib(args.calib)
+    CAMERA_HOST['ref'] = args.host
 
     # Camera reader — not a daemon thread, so we can join it on shutdown
     # and guarantee a TEARDOWN is sent before the process exits.

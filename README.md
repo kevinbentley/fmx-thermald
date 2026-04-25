@@ -36,17 +36,27 @@ official spec was used. Verified live on an ICI FMX 400P (MAC OUI
    standard `RTP/AVP/TCP`, the camera falls back to serving **lossy
    H.264 pseudocolor video** — which is what ffmpeg/VLC see. With
    `DH/AVP/TCP`, it streams raw radiometric frames.
-3. After PLAY, the socket delivers a repeating binary chunk:
+3. After PLAY, the socket carries TWO interleaved streams distinguished by
+   the channel byte that follows the `$` marker:
    ```
-   $ 0x08  <4-byte BE length = 221224>              # 6-byte packet header
-   HYAV <28-byte frame metadata>                    # 32-byte chunk header
-   <110592 bytes: MSB plane, row-major 384×288>     # high byte of each pixel
-   <110592 bytes: LSB plane, row-major 384×288>     # low byte of each pixel
-   hyav <10-byte trailer>
+   $ <chan>  <4-byte BE payload-length>              # 6-byte packet header
+   "HYAV" <tag 1B> <3 pad> <LE counter 4B> <LE size 4B> <16 bytes>   # 32-byte chunk header
+   <payload>                                         # contents depend on chan
+   "hyav" <LE size 4B>                               # 8-byte chunk trailer
    ```
-   Per-pixel `raw16 = MSB[y,x]*256 + LSB[y,x]`, unsigned. The 28-byte
-   metadata header turned out to be frame counter + timestamp + length —
-   **no calibration constants embedded**. You have to calibrate yourself.
+   - **chan 8** carries raw 16-bit radiometric frames. Fixed 221,224-byte
+     chunks at ~15 fps. Payload = `110592-byte MSB plane` + `110592-byte
+     LSB plane`, row-major 384×288. Per-pixel
+     `raw16 = MSB[y,x]*256 + LSB[y,x]`, unsigned.
+   - **chan 0** carries the camera's cooked pseudocolor video as grayscale
+     H.264. Variable 4–10 KB chunks; the first per session has
+     SPS/PPS/SEI/IDR (keyframe), subsequent chunks are single P-slices.
+     **Decoding chan 0 gives you the camera's internally-corrected image**
+     (NUC / bad-pixel / temporal smoothing already applied) — which is
+     why it's clean while the raw chan 8 shows sporadic MSB/LSB-sync
+     artifacts along scene edges.
+   The 28 bytes after the `HYAV` magic are frame counter + size + flags
+   — **no calibration constants embedded**. You have to calibrate yourself.
 4. The 28-byte HYAV metadata has no calibration constants. The camera's
    uint16 output is roughly `raw = 90 * (T_K − 244)`, which maps the
    16-bit range onto the sensor's ~ −29 °C to +697 °C operating span.
@@ -86,12 +96,14 @@ confirmed.
 ## Requirements
 
 - Python 3.10+
-- `numpy`, `Pillow`
+- `numpy`, `Pillow`, `av` (PyAV — used to decode the camera's cooked pseudocolor H.264)
 - A camera that negotiates `DH/AVP/TCP` and emits the HYAV framing above
 
 ```bash
-pip install numpy Pillow
+pip install numpy Pillow av
 ```
+
+PyAV is optional at runtime — if it's missing, the default `mode=cam` preview won't work but `mode=clahe` and `mode=linear` (which render from the raw radiometric plane) still will. `/status.h264_available` reports whether it's usable.
 
 ## Running
 
@@ -103,7 +115,21 @@ Open `http://<host>:8080/` in a browser — you'll see a live pseudocolor
 preview. Mousing over the image shows the temperature at the pixel under
 the cursor; hit **save snapshot** to dump the current frame to disk. The
 **step** and **auto** focus buttons drive the camera's lens motor via the
-port-36399 protocol described below.
+port-36399 protocol described below. The **camera / CLAHE / linear**
+buttons pick the preview render pipeline (see below).
+
+### Preview render modes
+
+| mode | source | notes |
+|---|---|---|
+| `cam` (default) | chan 0 H.264 (grayscale) → recolored with our ironbow LUT | What the camera itself produces, cleaned by its internal NUC/BPR. Matches IRFlash. 8-bit, lossy. |
+| `clahe` | chan 8 raw 16-bit → despeckle → CLAHE → LUT | 16-bit source; sensor edge artifacts visible along high-gradient regions. Tunable local contrast. |
+| `linear` | chan 8 raw 16-bit → despeckle → percentile stretch → LUT | Brightness strictly ∝ raw counts; same artifacts as CLAHE but less amplified. |
+
+`/preview.mjpg?mode=…` selects a mode. Temperature readouts (`/pixel`),
+`/snapshot.tiff`, and calibration are always computed from the raw chan 8
+plane regardless of preview mode. `THERMAL_MODE=<mode>` env var sets the
+default.
 
 ### Command-line options
 
@@ -117,6 +143,8 @@ port-36399 protocol described below.
 ### Environment variables
 
 - `THERMAL_SNAPSHOTS` — directory for saved snapshots (default `./snapshots`)
+- `THERMAL_MODE` — default preview render mode: `cam` (default), `clahe`, or `linear`
+- `THERMAL_SMOOTH` — N-frame temporal median on the raw radiometric plane, run at publish time. Default `3`. Set `1` to disable. A 3-frame median kills the random MSB/LSB-sync glitches since they land on a different pixel each frame; cost is `(N-1) * frame_period` latency (~133 ms at N=3, 15 fps) and a bit of RAM. Static-scene edge stripes aren't removed (they're scene-dependent, not temporal).
 
 ### HTTP endpoints
 
@@ -127,6 +155,8 @@ port-36399 protocol described below.
 | `GET /snapshot.tiff` | Most recent frame as 16-bit TIFF (no sidecar) |
 | `POST /snapshot?name=…` | Save `<name>.tiff`, `<name>.png`, `<name>.json` to snapshot dir. Auto-names by timestamp if `name` omitted. |
 | `POST /focus?cmd=step\|auto` | Send a lens-control command on port 36399. `step` = one manual focus step; `auto` = one-shot autofocus. Returns the framed bytes sent and the camera's ACK. |
+| `GET /camera/image` | Current `brightness`, `contrast`, `ddeGears`, `agcMode` on the camera + slider ranges + enum labels. Values are proxied from the vendor REST API. |
+| `PUT /camera/image` | Change one setting. Body: `{"name":"brightness\|contrast\|ddeGears\|agcMode","value":<int>}`. These control the camera's internal image pipeline → visible in **camera** mode only; raw radiometry paths (CLAHE/linear) are unaffected. |
 | `GET /pixel?x=&y=` | JSON: `raw16`, `T_C`, `T_F`, `T_K`, `calibrated` |
 | `GET /status` | JSON: readiness, frame stats, loaded calibration info |
 

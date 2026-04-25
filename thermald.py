@@ -28,6 +28,12 @@ from urllib.parse import urlparse, parse_qs
 import numpy as np
 from PIL import Image
 
+try:
+    import av          # PyAV — H.264 decoding for the camera's cooked pseudocolor feed
+    HAVE_AV = True
+except ImportError:
+    HAVE_AV = False
+
 # ---- Camera protocol constants --------------------------------------------
 W, H = 384, 288
 PIX = W * H
@@ -158,56 +164,199 @@ def _ironbow_lut():
 
 LUT = _ironbow_lut()
 
-def render_jpeg(raw16, quality=80):
-    """Percentile-stretch the raw 16-bit frame and ironbow-color it to JPEG."""
-    lo, hi = np.percentile(raw16, [2, 98])
-    if hi <= lo:
-        hi = lo + 1
-    norm = np.clip((raw16.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
-    rgb = LUT[norm]
+# Preview render modes:
+#   cam    — decode the camera's H.264 pseudocolor (chan 0) and recolor with our LUT.
+#            Matches vendor fidelity (NUC/BPR already applied) but is 8-bit & lossy.
+#   clahe  — raw radiometric (chan 8) → despeckle → CLAHE → LUT. 16-bit source, all
+#            sensor artifacts included; tunable contrast.
+#   linear — raw → despeckle → percentile stretch → LUT. Brightness ∝ temperature.
+# The hover readout, /snapshot.tiff, and calibration always use the raw plane.
+VALID_MODES = ('cam', 'clahe', 'linear')
+DEFAULT_MODE = os.environ.get('THERMAL_MODE', 'cam').lower()
+if DEFAULT_MODE not in VALID_MODES:
+    DEFAULT_MODE = 'cam'
+
+# Despeckle: the FMX's sensor/firmware emits rare pixels where the MSB and
+# LSB planes get out of sync by ±1 MSB, producing raw values ≈ ±256 off
+# from neighbors. These are visible as bright/dark speckles along high-
+# gradient edges in the scene. Replace any pixel that deviates from its
+# 3x3 neighborhood median by more than this threshold (in raw counts).
+DESPECKLE_THRESHOLD = 200
+
+# Temporal median over the last N frames, computed at publish time and used
+# as the canonical raw frame. Kills the MSB/LSB-sync glitches per-pixel
+# because the glitch lands on different pixels each frame, so a 3-frame
+# median recovers the true value. Set SMOOTH_N=1 to disable. Latency cost
+# is (SMOOTH_N-1) * frame_period (~133 ms at N=3, 15 fps).
+SMOOTH_N = max(1, int(os.environ.get('THERMAL_SMOOTH', '3')))
+
+def despeckle(raw16):
+    """Replace MSB/LSB-sync-error pixels with their 3x3 neighborhood median."""
+    src = raw16.astype(np.int32)
+    pad = np.pad(src, 1, mode='edge')
+    nbrs = np.stack([
+        pad[:-2, :-2], pad[:-2, 1:-1], pad[:-2, 2:],
+        pad[1:-1, :-2],                 pad[1:-1, 2:],
+        pad[2:,  :-2], pad[2:,  1:-1], pad[2:,  2:],
+    ])
+    nmed = np.median(nbrs, axis=0)
+    bad = np.abs(src - nmed) > DESPECKLE_THRESHOLD
+    out = raw16.copy()
+    out[bad] = nmed[bad].astype(raw16.dtype)
+    return out
+
+def _stretch_linear(raw16, lo_pct=1.0, hi_pct=99.0):
+    lo, hi = np.percentile(raw16, [lo_pct, hi_pct])
+    if hi <= lo: hi = lo + 1
+    return np.clip((raw16.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
+
+def _clahe_u8(raw16, tiles=(6, 8), clip_limit=2.5, nbins=256):
+    """Contrast-limited adaptive histogram equalization, numpy-only.
+
+    Compact range into `nbins` via a wide percentile clip, build per-tile
+    clipped-histogram CDFs, then bilinearly blend the 4 nearest tile LUTs
+    at each pixel. Returns uint8 (H, W).
+    """
+    H, W = raw16.shape
+    th, tw = tiles
+    tile_h, tile_w = H // th, W // tw
+
+    lo, hi = np.percentile(raw16, [0.5, 99.5])
+    if hi <= lo: hi = lo + 1
+    q = np.clip((raw16.astype(np.float32) - lo) * ((nbins - 1) / (hi - lo)),
+                0, nbins - 1).astype(np.int32)
+
+    luts = np.empty((th, tw, nbins), dtype=np.float32)
+    for i in range(th):
+        y0 = i * tile_h
+        y1 = (i + 1) * tile_h if i < th - 1 else H
+        for j in range(tw):
+            x0 = j * tile_w
+            x1 = (j + 1) * tile_w if j < tw - 1 else W
+            tile = q[y0:y1, x0:x1]
+            hist = np.bincount(tile.ravel(), minlength=nbins).astype(np.float32)
+            n_pix = tile.size
+            clip = max(1.0, clip_limit * n_pix / nbins)
+            excess = np.maximum(hist - clip, 0).sum()
+            np.minimum(hist, clip, out=hist)
+            hist += excess / nbins
+            cdf = np.cumsum(hist)
+            span = max(1.0, float(cdf[-1] - cdf[0]))
+            luts[i, j] = (cdf - cdf[0]) * (255.0 / span)
+
+    # Bilinear blend of the 4 nearest tile LUTs. Tile (i, j) center is at
+    # pixel (i*tile_h + tile_h/2, j*tile_w + tile_w/2); compute fractional
+    # tile coordinate per pixel and pick floor-corner + neighbor.
+    ys = np.arange(H)
+    xs = np.arange(W)
+    ty = (ys - tile_h / 2) / tile_h
+    tx = (xs - tile_w / 2) / tile_w
+    i0 = np.clip(np.floor(ty).astype(np.int32), 0, th - 2)
+    j0 = np.clip(np.floor(tx).astype(np.int32), 0, tw - 2)
+    fy = np.clip(ty - i0, 0, 1).astype(np.float32).reshape(-1, 1)
+    fx = np.clip(tx - j0, 0, 1).astype(np.float32).reshape(1, -1)
+    i0g = i0.reshape(-1, 1)
+    j0g = j0.reshape(1, -1)
+    L00 = luts[i0g,     j0g,     q]
+    L01 = luts[i0g,     j0g + 1, q]
+    L10 = luts[i0g + 1, j0g,     q]
+    L11 = luts[i0g + 1, j0g + 1, q]
+    out = (L00 * (1 - fy) * (1 - fx) + L01 * (1 - fy) * fx +
+           L10 *      fy  * (1 - fx) + L11 *      fy  * fx)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+def render_jpeg(mode, *, raw=None, gray=None, quality=85):
+    """Colorize the frame with ironbow and JPEG-encode.
+      mode='cam'    — recolor the camera's grayscale H.264 frame (must pass gray)
+      mode='clahe'  — raw → despeckle → CLAHE → LUT (must pass raw)
+      mode='linear' — raw → despeckle → percentile stretch → LUT (must pass raw)
+    Returns bytes, or None if the requested source isn't available yet."""
+    if mode == 'cam':
+        if gray is None:
+            return None
+        rgb = LUT[gray]
+    else:
+        if raw is None:
+            return None
+        cleaned = despeckle(raw)
+        norm = _stretch_linear(cleaned) if mode == 'linear' else _clahe_u8(cleaned)
+        rgb = LUT[norm]
     buf = io.BytesIO()
     Image.fromarray(rgb, 'RGB').save(buf, 'JPEG', quality=quality)
     return buf.getvalue()
 
 # ---- Shared frame store ---------------------------------------------------
 class FrameStore:
+    """Holds the latest raw (radiometric) and gray (H.264-decoded) frames.
+    Raw and gray are published by different sources on the RTSP socket and
+    arrive at slightly different rates, so they have independent sequence
+    numbers. Consumers wait on whichever they care about."""
     def __init__(self):
         self.cond = threading.Condition()
-        self.raw = None       # np.uint16 array (H, W)
+        self.raw = None       # np.uint16 (H, W) — canonical (post-smoothing) radiometric
         self.md = None        # 28-byte HYAV metadata header
-        self.seq = 0
-        self.ts = 0.0
-        self.jpeg = None
+        self.raw_seq = 0
+        self.raw_ts = 0.0
+        # Ring buffer of the last SMOOTH_N raw frames used for temporal median.
+        self._raw_hist = []
+        self.gray = None      # np.uint8 (H, W) — camera pseudocolor (chan 0)
+        self.gray_seq = 0
+        self.gray_ts = 0.0
 
-    def publish(self, raw, md):
-        jpeg = render_jpeg(raw)
+    def publish_raw(self, raw, md):
         with self.cond:
-            self.raw = raw
+            # Temporal median over the last SMOOTH_N frames. Before we have
+            # a full window, use what we've got (median is still well-defined).
+            if SMOOTH_N <= 1:
+                smoothed = raw
+            else:
+                self._raw_hist.append(raw)
+                if len(self._raw_hist) > SMOOTH_N:
+                    self._raw_hist.pop(0)
+                if len(self._raw_hist) == 1:
+                    smoothed = raw
+                else:
+                    smoothed = np.median(np.stack(self._raw_hist), axis=0).astype(np.uint16)
+            self.raw = smoothed
             self.md = md
-            self.seq += 1
-            self.ts = time.time()
-            self.jpeg = jpeg
+            self.raw_seq += 1
+            self.raw_ts = time.time()
             self.cond.notify_all()
 
-    def wait_next(self, last_seq, timeout=5.0):
+    def publish_gray(self, gray):
+        with self.cond:
+            self.gray = gray
+            self.gray_seq += 1
+            self.gray_ts = time.time()
+            self.cond.notify_all()
+
+    def wait_frame(self, last_seq, which='gray', timeout=5.0):
+        """Wait for the next 'raw' or 'gray' frame past last_seq.
+        Returns (seq, frame) or None on timeout."""
         with self.cond:
             deadline = time.monotonic() + timeout
-            while self.seq == last_seq:
+            while True:
+                seq  = self.gray_seq if which == 'gray' else self.raw_seq
+                data = self.gray     if which == 'gray' else self.raw
+                if data is not None and seq != last_seq:
+                    return seq, data
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self.cond.wait(remaining)
-            return self.seq, self.jpeg
 
     def snapshot(self):
+        """Latest frame pair. Returns None if no raw frame received yet."""
         with self.cond:
             if self.raw is None:
                 return None
             return {
                 'raw': self.raw.copy(),
                 'md': self.md,
-                'seq': self.seq,
-                'ts': self.ts,
+                'seq': self.raw_seq,
+                'ts': self.raw_ts,
+                'gray': self.gray.copy() if self.gray is not None else None,
+                'gray_seq': self.gray_seq,
             }
 
 STORE = FrameStore()
@@ -234,6 +383,11 @@ class RTSPClient:
         self.send_lock = threading.Lock()
         self.resp_queue = queue.Queue()
         self._closed = False
+        # H.264 decoder for chan 0 (camera's cooked pseudocolor). Lazily
+        # constructed — we need a fresh decoder per RTSP session so it re-
+        # acquires SPS/PPS from the first keyframe after reconnect.
+        self.h264 = None
+        self._h264_errors = 0
 
     # -- low-level socket helpers --
     def _read_exact(self, n):
@@ -332,16 +486,43 @@ class RTSPClient:
                 sys.stderr.write(f'[rtsp] unexpected byte 0x{b:02x}, resyncing\n')
 
     def _handle_interleaved(self, chan, body):
-        if len(body) < 32 or body[:4] != b'HYAV':
-            return  # not a radiometric frame — ignore
-        md = body[4:32]
-        if len(body) < 32 + FRAME_DATA:
+        # Both video (chan 0) and radiometric (chan 8) arrive as HYAV chunks.
+        # Layout: "HYAV" + 28-byte header + payload + 8-byte trailer ("hyav" + LE size).
+        if len(body) < 32 + 8 or body[:4] != b'HYAV':
             return
-        data = body[32:32 + FRAME_DATA]
-        msb = np.frombuffer(data[:PLANE], dtype=np.uint8).reshape(H, W)
-        lsb = np.frombuffer(data[PLANE:], dtype=np.uint8).reshape(H, W)
-        raw = (msb.astype(np.uint16) << 8) | lsb.astype(np.uint16)
-        STORE.publish(raw, bytes(md))
+        md = body[4:32]
+        payload = body[32:-8]
+        if chan == 8:
+            # Raw radiometric: MSB plane then LSB plane, row-major 384x288.
+            if len(payload) < FRAME_DATA:
+                return
+            msb = np.frombuffer(payload[:PLANE], dtype=np.uint8).reshape(H, W)
+            lsb = np.frombuffer(payload[PLANE:2*PLANE], dtype=np.uint8).reshape(H, W)
+            raw = (msb.astype(np.uint16) << 8) | lsb.astype(np.uint16)
+            STORE.publish_raw(raw, bytes(md))
+        elif chan == 0 and HAVE_AV:
+            # Camera's cooked pseudocolor (grayscale H.264). Feed each chunk
+            # to the decoder; SPS/PPS/IDR arrive with the first keyframe.
+            if self.h264 is None:
+                try:
+                    self.h264 = av.CodecContext.create('h264', 'r')
+                except Exception as e:
+                    sys.stderr.write(f'[cam] H.264 decoder init failed: {e}\n')
+                    self.h264 = False   # sentinel: never retry
+                    return
+            if self.h264 is False:
+                return
+            try:
+                for frame in self.h264.decode(av.Packet(payload)):
+                    gray = frame.to_ndarray(format='gray8')
+                    STORE.publish_gray(gray)
+            except av.error.InvalidDataError:
+                # First couple of P-slices before the initial keyframe land here.
+                self._h264_errors += 1
+            except Exception as e:
+                self._h264_errors += 1
+                if self._h264_errors <= 3:
+                    sys.stderr.write(f'[cam] H.264 decode error: {e}\n')
 
     def keepalive(self):
         try:
@@ -394,9 +575,65 @@ def camera_supervisor(host):
         backoff = min(backoff * 2, 30.0)
     sys.stderr.write('[cam] supervisor exiting\n')
 
+# ---- Camera admin client (HTTP /v1/...) -----------------------------------
+# Thin wrapper around the camera's REST API used to proxy image-control
+# settings (brightness/contrast/AGC/DDE) from our dashboard. Thread-safe:
+# the JWT is cached under a lock and refreshed on 401.
+class CameraClient:
+    def __init__(self, host, user='admin', password='admin'):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.token = None
+        self.lock = threading.Lock()
+
+    def _login(self):
+        import urllib.request, urllib.parse
+        url = f'http://{self.host}/v1/user/login?' + urllib.parse.urlencode(
+            {'date': int(time.time()*1000), 'username': self.user, 'password': self.password})
+        with urllib.request.urlopen(url, timeout=5) as r:
+            body = json.loads(r.read().decode())
+        self.token = body['Data']['Token']
+
+    def request(self, method, path, params=None, data=None):
+        import urllib.request, urllib.parse, urllib.error
+        params = dict(params or {}); params.setdefault('date', int(time.time()*1000))
+        body_bytes = json.dumps(data).encode() if data is not None else None
+        for attempt in range(2):
+            with self.lock:
+                if not self.token:
+                    self._login()
+                token = self.token
+            url = f'http://{self.host}/v1{path}?' + urllib.parse.urlencode(params)
+            headers = {'X-Token': token, 'Accept': 'application/json'}
+            if body_bytes is not None:
+                headers['Content-Type'] = 'application/json'
+            req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    with self.lock: self.token = None
+                    continue
+                raise
+        raise RuntimeError('camera auth failed')
+
+CAMERA = None   # CameraClient instance, created in main()
+
 # ---- HTTP server ----------------------------------------------------------
 SNAPSHOT_DIR = os.environ.get('THERMAL_SNAPSHOTS', '/home/kbentley/thermal/snapshots')
 CAMERA_HOST = {'ref': DEFAULT_HOST}  # filled in by main() from --host
+
+# Image-control settings we proxy. Each entry is:
+#   (ui-key,  GET path,  SET path,  PUT-body-key,  slider min/max/step or None for enum)
+IMAGE_SETTINGS = [
+    ('brightness', '/cmd01/agcmenu/GetBrightness', '/cmd01/agcmenu/SetBrightness', 'bright',   (0, 255, 1)),
+    ('contrast',   '/cmd01/agcmenu/GetContrast',   '/cmd01/agcmenu/SetContrast',   'contrast', (0, 100, 1)),
+    ('ddeGears',   '/cmd01/agcmenu/GetDDEGears',   '/cmd01/agcmenu/SetDDEGears',   'gear',     (0,   8, 1)),
+    ('agcMode',    '/cmd01/agcmenu/GetAGCMode',    '/cmd01/agcmenu/SetAGCMode',    'mode',     None),  # enum 0..3
+]
+AGC_MODE_LABELS = {0: 'manual', 1: 'auto', 2: 'histogram', 3: 'plateau'}
 
 INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>thermald</title>
 <style>
@@ -432,8 +669,38 @@ INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>thermald
  <button onclick="focusCmd('step')" title="one manual focus step">step</button>
  <button onclick="focusCmd('auto')" title="one-shot autofocus">auto</button>
  <span id="focusmsg" style="font-family:monospace;font-size:13px;margin-left:8px;color:#aaa"></span>
+ <span style="margin-left:12px;padding-left:12px;border-left:1px solid #444"></span>
+ mode:
+ <button id="mode-cam"    onclick="setMode('cam')"    title="camera's pseudocolor H.264 + our ironbow LUT (clean, matches IRFlash)">camera</button>
+ <button id="mode-clahe"  onclick="setMode('clahe')"  title="raw radiometric + despeckle + CLAHE (16-bit source; sensor edge artifacts visible)">CLAHE</button>
+ <button id="mode-linear" onclick="setMode('linear')" title="raw radiometric + despeckle + linear stretch (brightness ∝ temperature)">linear</button>
  <br><span id="snapmsg"></span>
 </p>
+<div id="camcfg" style="margin-top:14px;padding:12px;background:#1a1a1a;border:1px solid #333;max-width:768px;font-size:14px">
+ <div style="font-weight:600;margin-bottom:8px">Camera image settings <span id="camcfg-status" style="font-weight:400;color:#888;margin-left:8px"></span></div>
+ <div style="display:grid;grid-template-columns:110px 1fr 60px;gap:8px 12px;align-items:center">
+  <label>brightness</label>
+  <input type="range" id="s-brightness" min="0" max="255" step="1">
+  <span id="v-brightness" style="font-family:monospace">—</span>
+
+  <label>contrast</label>
+  <input type="range" id="s-contrast" min="0" max="100" step="1">
+  <span id="v-contrast" style="font-family:monospace">—</span>
+
+  <label>DDE gears</label>
+  <input type="range" id="s-ddeGears" min="0" max="8" step="1">
+  <span id="v-ddeGears" style="font-family:monospace">—</span>
+
+  <label>AGC mode</label>
+  <select id="s-agcMode" style="grid-column:span 2">
+   <option value="0">0 — manual</option>
+   <option value="1">1 — auto</option>
+   <option value="2">2 — histogram</option>
+   <option value="3">3 — plateau</option>
+  </select>
+ </div>
+ <div style="color:#888;font-size:12px;margin-top:6px">These control the camera's internal pipeline → visible in <b>camera</b> mode only. Raw radiometry (CLAHE/linear modes) is unaffected.</div>
+</div>
 <p>Endpoints:
 <a href="/snapshot.tiff">/snapshot.tiff</a> &middot;
 <a href="/status">/status</a> &middot;
@@ -445,6 +712,19 @@ const xh=document.getElementById('xh');
 const readout=document.getElementById('readout');
 const calib=document.getElementById('calib');
 let pending=null, inflight=false;
+
+const MODES = ['cam','clahe','linear'];
+let currentMode = localStorage.getItem('thermalMode') || 'cam';
+if(!MODES.includes(currentMode)) currentMode = 'cam';
+function setMode(m){
+  currentMode = m;
+  localStorage.setItem('thermalMode', m);
+  for(const k of MODES){
+    document.getElementById('mode-'+k).style.fontWeight = (m===k?'700':'400');
+  }
+  view.src = '/preview.mjpg?mode=' + m + '&t=' + Date.now();
+}
+setMode(currentMode);
 
 // Calibration badge from /status
 fetch('/status').then(r=>r.json()).then(s=>{
@@ -521,6 +801,63 @@ async function focusCmd(cmd){
     msg.style.color='#f88'; msg.textContent=cmd+': '+e;
   }
 }
+
+// Camera image settings — load current state, wire sliders/select to PUT on change.
+const CAM_KEYS = ['brightness','contrast','ddeGears','agcMode'];
+const camStatus = document.getElementById('camcfg-status');
+
+async function camcfgLoad(){
+  camStatus.textContent='loading…';
+  try{
+    const r = await fetch('/camera/image');
+    const j = await r.json();
+    for(const k of CAM_KEYS){
+      const v = j.settings?.[k];
+      const el = document.getElementById('s-'+k);
+      const out = document.getElementById('v-'+k);
+      if(v==null){ if(out) out.textContent='—'; continue; }
+      el.value = v;
+      if(out) out.textContent = v;
+    }
+    camStatus.textContent = j.errors ? ('some reads failed: '+Object.keys(j.errors).join(',')) : 'ok';
+    camStatus.style.color = j.errors ? '#fc0' : '#8f8';
+  }catch(e){
+    camStatus.textContent = 'load error: '+e;
+    camStatus.style.color = '#f88';
+  }
+}
+
+async function camcfgSet(name, value){
+  camStatus.textContent = name+' = '+value+' …';
+  camStatus.style.color = '#aaa';
+  try{
+    const r = await fetch('/camera/image', {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, value: Number(value)}),
+    });
+    const j = await r.json();
+    if(j.error){ camStatus.textContent = name+' error: '+j.error; camStatus.style.color = '#f88'; return; }
+    const out = document.getElementById('v-'+name);
+    if(out) out.textContent = value;
+    camStatus.textContent = name+' ← '+value; camStatus.style.color = '#8f8';
+  }catch(e){
+    camStatus.textContent = name+' error: '+e; camStatus.style.color = '#f88';
+  }
+}
+
+// debounce slider input → send when user pauses for 150ms
+function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+
+for(const k of ['brightness','contrast','ddeGears']){
+  const el = document.getElementById('s-'+k);
+  const out = document.getElementById('v-'+k);
+  const send = debounce(v => camcfgSet(k, v), 150);
+  el.addEventListener('input', () => { out.textContent = el.value; send(el.value); });
+}
+document.getElementById('s-agcMode').addEventListener('change', e => camcfgSet('agcMode', e.target.value));
+
+camcfgLoad();
 </script></body></html>""".encode('utf-8')
 
 def _save_snapshot(name):
@@ -534,11 +871,17 @@ def _save_snapshot(name):
     png_path  = os.path.join(SNAPSHOT_DIR, f'{name}.png')
     json_path = os.path.join(SNAPSHOT_DIR, f'{name}.json')
     raw = snap['raw']
+    # TIFF preserves the raw radiometric data exactly as received (no despeckle).
     Image.fromarray(raw, mode='I;16').save(tiff_path)
-    lo, hi = np.percentile(raw, [2, 98])
-    if hi <= lo: hi = lo + 1
-    norm = np.clip((raw.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
-    Image.fromarray(LUT[norm], 'RGB').save(png_path)
+    # PNG uses whichever mode the preview defaults to.
+    gray = snap.get('gray')
+    if DEFAULT_MODE == 'cam' and gray is not None:
+        rgb = LUT[gray]
+    else:
+        cleaned = despeckle(raw)
+        norm = _stretch_linear(cleaned) if DEFAULT_MODE == 'linear' else _clahe_u8(cleaned)
+        rgb = LUT[norm]
+    Image.fromarray(rgb, 'RGB').save(png_path)
     t_c = raw_to_C(raw)
     stats_key = 'stats_C' if CALIB is not None else 'stats_uncalibrated_C'
     meta = {
@@ -581,13 +924,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(INDEX_HTML)
             return
         if u.path == '/preview.mjpg':
-            return self._mjpeg()
+            return self._mjpeg(parse_qs(u.query))
         if u.path == '/snapshot.tiff':
             return self._tiff()
         if u.path == '/pixel':
             return self._pixel(parse_qs(u.query))
         if u.path == '/status':
             return self._status()
+        if u.path == '/camera/image':
+            return self._camera_image_get()
         self.send_error(404)
 
     def do_POST(self):
@@ -601,7 +946,64 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(out)
         if u.path == '/focus':
             return self._focus(parse_qs(u.query))
+        # Also accept POST on /camera/image for convenience (same body shape as PUT).
+        if u.path == '/camera/image':
+            return self._camera_image_set()
         self.send_error(404)
+
+    def do_PUT(self):
+        u = urlparse(self.path)
+        if u.path == '/camera/image':
+            return self._camera_image_set()
+        self.send_error(404)
+
+    def _camera_image_get(self):
+        """Read current brightness/contrast/AGC/DDEGears from the camera."""
+        if CAMERA is None:
+            return self._json({'error': 'camera client not initialized'}, 503)
+        out = {'settings': {}, 'ranges': {}, 'labels': {'agcMode': AGC_MODE_LABELS}}
+        for key, get_path, _set, _body_key, rng in IMAGE_SETTINGS:
+            try:
+                r = CAMERA.request('GET', get_path)
+                out['settings'][key] = r.get('Data')
+            except Exception as e:
+                out['settings'][key] = None
+                out.setdefault('errors', {})[key] = f'{type(e).__name__}: {e}'
+            if rng is not None:
+                out['ranges'][key] = {'min': rng[0], 'max': rng[1], 'step': rng[2]}
+        return self._json(out)
+
+    def _camera_image_set(self):
+        """PUT a single setting. Body: {name: <ui-key>, value: <int>}."""
+        if CAMERA is None:
+            return self._json({'error': 'camera client not initialized'}, 503)
+        length = int(self.headers.get('Content-Length', '0'))
+        try:
+            body = json.loads(self.rfile.read(length).decode()) if length else {}
+        except Exception as e:
+            return self._json({'error': f'bad JSON: {e}'}, 400)
+        name  = body.get('name')
+        value = body.get('value')
+        if value is None:
+            return self._json({'error': 'value required'}, 400)
+        row = next((s for s in IMAGE_SETTINGS if s[0] == name), None)
+        if row is None:
+            return self._json({'error': f'unknown setting; expected one of {[s[0] for s in IMAGE_SETTINGS]}'}, 400)
+        _key, _get, set_path, body_key, rng = row
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return self._json({'error': 'value must be an integer'}, 400)
+        if rng is not None and not (rng[0] <= value <= rng[1]):
+            return self._json({'error': f'{name} out of range [{rng[0]},{rng[1]}]'}, 400)
+        # The cmd01 SetXxx endpoints take their payload as QUERY PARAMS, not
+        # JSON body (axios 'params:e' in the vendor SPA). JSON body is
+        # silently accepted with Code=200 but ignored.
+        try:
+            r = CAMERA.request('PUT', set_path, params={body_key: value})
+        except Exception as e:
+            return self._json({'error': f'camera call failed: {type(e).__name__}: {e}'}, 502)
+        return self._json({'name': name, 'value': value, 'camera_response': r})
 
     def _focus(self, qs):
         cmd = (qs.get('cmd', [''])[0] or '').lower()
@@ -619,7 +1021,12 @@ class Handler(BaseHTTPRequestHandler):
             'ack': resp == ack,
         })
 
-    def _mjpeg(self):
+    def _mjpeg(self, qs):
+        mode = (qs.get('mode', [DEFAULT_MODE])[0] or DEFAULT_MODE).lower()
+        if mode not in VALID_MODES:
+            mode = DEFAULT_MODE
+        # 'cam' mode waits on grayscale updates; 'clahe'/'linear' wait on raw.
+        which = 'gray' if mode == 'cam' else 'raw'
         bnd = b'thermalframe'
         self.send_response(200)
         self.send_header('Content-Type', f'multipart/x-mixed-replace; boundary={bnd.decode()}')
@@ -629,10 +1036,15 @@ class Handler(BaseHTTPRequestHandler):
         last = -1
         try:
             while not STOP.is_set():
-                r = STORE.wait_next(last, timeout=1)
+                r = STORE.wait_frame(last, which=which, timeout=1)
                 if r is None:
                     continue
-                last, jpeg = r
+                last, data = r
+                jpeg = render_jpeg(mode,
+                                   gray=data if mode == 'cam' else None,
+                                   raw =data if mode != 'cam' else None)
+                if jpeg is None:
+                    continue
                 hdr = (b'\r\n--' + bnd + b'\r\nContent-Type: image/jpeg\r\n'
                        b'Content-Length: ' + str(len(jpeg)).encode() + b'\r\n\r\n')
                 self.wfile.write(hdr); self.wfile.write(jpeg); self.wfile.flush()
@@ -682,6 +1094,10 @@ class Handler(BaseHTTPRequestHandler):
             'width': W, 'height': H,
             'snapshot_dir': SNAPSHOT_DIR,
             'calibration': calib_info(),
+            'default_mode': DEFAULT_MODE,
+            'h264_available': HAVE_AV,
+            'gray_ready': snap is not None and snap.get('gray') is not None,
+            'gray_seq': snap['gray_seq'] if snap is not None else 0,
         }
         if snap is not None:
             raw = snap['raw']
@@ -711,6 +1127,8 @@ def main():
 
     load_calib(args.calib)
     CAMERA_HOST['ref'] = args.host
+    global CAMERA
+    CAMERA = CameraClient(args.host)
 
     # Camera reader — not a daemon thread, so we can join it on shutdown
     # and guarantee a TEARDOWN is sent before the process exits.
